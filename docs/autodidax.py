@@ -70,7 +70,7 @@ sys.excepthook = info
 # the fly as we execute the Python function to be transformed. To start, let's
 # define these primitives so that we can intercept their application:
 
-
+# +
 from typing import NamedTuple
 
 class Primitive(NamedTuple):
@@ -83,6 +83,8 @@ sin_p = Primitive("sin")
 cos_p = Primitive("cos")
 reduce_sum_p = Primitive("reduce_sum")
 greater_p = Primitive("greater")
+transpose_p = Primitive("transpose")
+broadcast_p = Primitive("broadcast")
 
 def add(x, y): return bind1(add_p, x, y)
 def mul(x, y): return bind1(mul_p, x, y)
@@ -91,10 +93,13 @@ def sin(x): return bind1(sin_p, x)
 def cos(x): return bind1(cos_p, x)
 def reduce_sum(x, axis=None): return bind1(reduce_sum_p, x, axis=axis)
 def greater(x, y): return bind1(greater_p, x, y)
+def transpose(x, perm): return bind1(transpose_p, perm=perm)
+def broadcast(x, shape, axes): return bind1(broadcast_p, x, shape=shape, axes=axes)
 
 def bind1(prim, *args, **params):
   out, = bind(prim, *args, **params)
   return out
+# -
 
 # We'll set up array data types and infix operator methods in a moment.
 #
@@ -375,6 +380,11 @@ impl_rules[sin_p] = lambda x: [np.sin(x)]
 impl_rules[cos_p] = lambda x: [np.cos(x)]
 impl_rules[reduce_sum_p] = lambda x, *, axis: [np.sum(x, axis)]
 impl_rules[greater_p] = lambda x, y: [np.greater(x, y)]
+impl_rules[transpose_p] = lambda x, *, perm: [np.transpose(x, perm)]
+
+def broadcast_impl(x, *, shape, axes):
+  return [np.broadcast_to(np.expand_dims(x, axes), shape)]
+impl_rules[broadcast_p] = broadcast_impl
 
 # With this interpreter, we can evaluate user functions:
 
@@ -673,13 +683,16 @@ def move_batch_axis(axis_size, src, dst, x):
   if src is not_mapped:
     target_shape = list(np.shape(x))
     target_shape.insert(dst, axis_size)
-    assert not isinstance(x, Tracer)  # TODO gotta handle tracers here!
-    return np.broadcast_to(np.expand_dims(x, dst), target_shape)
+    return broadcast(x, target_shape, [dst])
   elif src == dst:
     return x
   else:
-    assert not isinstance(x, Tracer)  # TODO gotta handle tracers here!
-    return np.moveaxis(x, src, dst)
+    return moveaxis(x, src, dst)
+
+def moveaxis(x, src: int, dst: int):
+  perm = [i for i in range(np.ndim(x)) if i != src]
+  perm.insert(dst, src)
+  return transpose(x, perm)
 
 # The `Tracer` for vectorized batching carries a batched value and an optional
 # integer indicating which axis (if any) is the batch axis.
@@ -1094,13 +1107,15 @@ class JaxprBuilder:
     return jaxpr, constvals
 
 # The rules we need for `JaxprTrace.process_primitive` are essentially typing
-# rules for primitive applications: given   the primitive, its parameters, and
+# rules for primitive applications: given the primitive, its parameters, and
 # types for the inputs, the rule must produce a type for the output, which is
-# then   packaged with the output `JaxprTracer`. We can use abstract evaluation
-# rules for this same purpose, even though they  can be more general (since
-# abstract evaluation rules need to work on ConcreteArray inputs as well). We'll
-# reuse these abstract evaluation rules for the other jaxpr-producing trace
-# machinery, where the potential extra generality is useful.
+# then packaged with the output `JaxprTracer`. We can use abstract evaluation
+# rules for this same purpose, even though they can be more general (since
+# abstract evaluation rules must accept ConcreteArray inputs, and since they
+# need only return an upper bound on the set of possible outputs, they can
+# produce ConcreteArray outputs as well). We'll reuse these abstract evaluation
+# rules for the other jaxpr-producing trace machinery, where the potential extra
+# generality is useful.
 
 # +
 def broadcast_shapes(*shapes):
@@ -1130,6 +1145,10 @@ def reduce_sum_abstract_eval_rule(aval_in, *, axis):
   new_shape = [d for i, d in enumerate(aval_in.shape) if i != axis]
   return [ShapedArray(tuple(new_shape), aval_in.dtype)]
 abstract_eval_rules[reduce_sum_p] = reduce_sum_abstract_eval_rule
+
+def broadcast_abstract_eval(x, *, shape, axes):
+  return [ShapedArray(tuple(shape), np.result_type(x))]
+abstract_eval_rules[broadcast_p] = broadcast_abstract_eval
 # -
 
 # To check our implementation of jaxprs, we can add a `make_jaxpr`
@@ -1392,7 +1411,7 @@ def xla_callable(hashable_jaxpr: IDHashable, hashable_consts: Tuple[IDHashable])
   outs = jaxpr_subcomp(c, jaxpr, xla_consts + xla_params)
   out = xops.Tuple(c, outs)
   compiled = xb.get_backend(None).compile(c.build(out))
-  return partial(execute_compiled, compiled)
+  return partial(execute_compiled, compiled, [v.aval for v in jaxpr.outs])
 
 def _xla_consts(c: xe.XlaBuilder, consts: List[Any]) -> List[xe.XlaOp]:
   unique_consts = {id(cnst): cnst for cnst in consts}
@@ -1431,16 +1450,20 @@ def jaxpr_subcomp(c: xe.XlaBuilder, jaxpr: Jaxpr, args: List[xe.XlaOp]
     map(write, eqn.out_binders, out_vals)
   return map(read, jaxpr.outs)
 
-def execute_compiled(compiled, *args):
+def execute_compiled(compiled, out_avals, *args):
   input_bufs = [input_handlers[type(x)](x) for x in args]
   out_bufs = compiled.execute(input_bufs)
-  return [buf.to_py() for buf in out_bufs]
+  return [handle_result(aval, buf) for aval, buf in zip(out_avals, out_bufs)]
 
 input_handlers = {
     int: xb.get_backend(None).buffer_from_pyval,
     float: xb.get_backend(None).buffer_from_pyval,
     np.ndarray: xb.get_backend(None).buffer_from_pyval,
 }
+
+def handle_result(aval: ShapedArray, buf):
+  del aval  # Unused for now.
+  return buf.to_py()
 
 xla_translations = {}
 # -
@@ -1470,6 +1493,11 @@ def reduce_sum_translation(c, in_avals, in_vals, *, axis):
   return [xops.Reduce(c, [x], [zero], subc.build(), [axis])]
 xla_translations[reduce_sum_p] = reduce_sum_translation
 
+def broadcast_translation(c, in_avals, in_vals, *, shape, axes):
+  x, = in_vals
+  dims_complement = [i for i in range(len(shape)) if i not in axes]
+  return [xops.BroadcastInDim(x, shape, dims_complement)]
+xla_translations[broadcast_p] = broadcast_translation
 
 # With that, we can now use `jit` to stage out, compile, and execute programs
 # with XLA!
@@ -1577,12 +1605,57 @@ y, ydot = jvp(f, (x,), (xdot,))
 print(y)
 print(ydot)
 
-# TODO fix the todos in move_batch_axis
-# ys = vmap(f, (0,))(np.arange(3.))
-# print(ys)
+ys = vmap(f, (0,))(np.arange(3.))
+print(ys)
+# -
 
+# One piece missing is device memory persistence for arrays. That is, we've
+# defined `handle_result` to transfer results back to CPU memory as NumPy
+# arrays, but it's often preferrable to avoid transferring results just to
+# transfer them back for the next operation. We can do that by introducing a
+# `DeviceArray` class, which can wrap XLA buffers and otherwise duck-type
+# `numpy.ndarray`s:
 
 # +
-# TODO transpose primitive
-# TODO device arrays
+def handle_result(aval: ShapedArray, buf):
+  return DeviceArray(aval, buf)
+
+class DeviceArray:
+  buf: Any
+  aval: ShapedArray
+
+  def __init__(self, aval, buf):
+    self.aval = aval
+    self.buf = buf
+
+  dtype = property(lambda self: self.aval.dtype)
+  shape = property(lambda self: self.aval.shape)
+  ndim  = property(lambda self: self.aval.ndim)
+
+  def __array__(self): return self.buf.to_py()
+  def __repr__(self):  return repr(self.buf.to_py())
+  def __str__(self):   return str(self.buf.to_py())
+
+  _neg = staticmethod(neg)
+  _add = staticmethod(add)
+  _radd = staticmethod(add)
+  _mul = staticmethod(mul)
+  _rmul = staticmethod(mul)
+  _gt = staticmethod(greater)
+input_handlers[DeviceArray] = lambda x: x.buf
+
+# +
+@jit
+def f(x):
+  y = sin(x) * 2.
+  z = - y + x
+  return z
+
+x, xdot = 3., 1.
+y, ydot = jvp(f, (x,), (xdot,))
+print(y)
+print(ydot)
+
+# +
 # TODO vmap with collectives
+# TODO EpsilonBallArray
